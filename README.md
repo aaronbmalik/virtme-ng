@@ -79,6 +79,7 @@ To install virtme-ng from source you can clone this git repository and build a
 standalone virtme-ng running the following commands:
 ```
  $ git clone --recurse-submodules https://github.com/arighi/virtme-ng.git
+ $ cd virtme-ng/
  $ BUILD_VIRTME_NG_INIT=1 pip3 install .
 ```
 
