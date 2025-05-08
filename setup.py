@@ -114,6 +114,7 @@ package_files = [
     "virtme-init",
     "virtme-udhcpc-script",
     "virtme-sshd-script",
+    "virtme-ssh-proxy",
     "virtme-snapd-script",
     "virtme-sound-script",
 ]
@@ -153,9 +154,6 @@ setup(
     install_requires=[
         "argcomplete",
         "requests",
-        # `pkg_resources` is removed in python 3.12, moved to setuptools.
-        #
-        # TODO: replace pkg_resources with importlib. # pylint: disable=fixme
         "setuptools",
     ],
     entry_points={
@@ -173,6 +171,7 @@ setup(
     data_files=data_files,
     scripts=[
         "bin/virtme-prep-kdir-mods",
+        "bin/virtme-ssh-proxy",
     ],
     include_package_data=True,
     classifiers=[

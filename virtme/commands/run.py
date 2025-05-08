@@ -24,7 +24,13 @@ from shutil import which
 from time import sleep
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
-from virtme_ng.utils import CACHE_DIR
+from virtme_ng.utils import (
+    DEFAULT_VIRTME_SSH_HOSTNAME_CID_SEPARATOR,
+    SSH_CONF_FILE,
+    SSH_DIR,
+    VIRTME_SSH_DESTINATION_NAME,
+    VIRTME_SSH_HOSTNAME_CID_SEPARATORS,
+)
 
 from .. import architectures, mkinitramfs, modfinder, qemu_helpers, resources, virtmods
 from ..util import SilentError, find_binary_or_raise, get_username
@@ -367,6 +373,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="To start in the VM a different command than the default one (--server), "
         + "or to launch this command instead of a prompt (--client).",
     )
+    g.add_argument(
+        "--ssh-tcp",
+        action="store_true",
+        help="Use TCP for the SSH connection to the guest",
+    )
+
     return parser
 
 
@@ -436,12 +448,14 @@ def get_kernel_version(path, img_name: Optional[str] = None):
         arg_fail(f"kernel file {path} does not exist, try --build to build the kernel")
     if not os.access(path, os.R_OK):
         arg_fail(f"unable to access {path} (check for read permissions)")
+
+    version_pattern = r"\S{3,}"
     try:
         result = subprocess.run(
             ["file", path], capture_output=True, text=True, check=False
         )
         for item in result.stdout.split(", "):
-            match = re.search(r"^[vV]ersion (\S{3,})", item)
+            match = re.search(rf"^[vV]ersion ({version_pattern})", item)
             if match:
                 kernel_version = match.group(1)
                 return kernel_version
@@ -454,7 +468,7 @@ def get_kernel_version(path, img_name: Optional[str] = None):
     result = subprocess.run(
         ["strings", path], capture_output=True, text=True, check=False
     )
-    match = re.search(r"Linux version (\S{3,})", result.stdout)
+    match = re.search(rf"Linux version ({version_pattern})", result.stdout)
     if match:
         kernel_version = match.group(1)
         return kernel_version
@@ -462,7 +476,10 @@ def get_kernel_version(path, img_name: Optional[str] = None):
     # The version detection fails s390x using file or strings tools, so check
     # if the file itself contains the version number.
     if img_name is not None:
-        match = re.search(rf"{img_name}-(\S{{3,}})", path)
+        match = re.search(rf"{img_name}-({version_pattern})", path)
+        if match:
+            return match.group(1)
+        match = re.search(rf"/lib/modules/({version_pattern})/{img_name}", path)
         if match:
             return match.group(1)
 
@@ -585,8 +602,16 @@ def find_kernel_and_mods(arch, args) -> Kernel:
         if modmode == "none":
             pass
         elif modmode in ("use", "auto"):
+            if args.root != "/":
+                kernel.use_root_mods = True
+                kernel.moddir = f"{args.root}/usr/lib/modules/{kernel.version}"
+                if not os.path.exists(kernel.moddir):
+                    kernel.moddir = f"{args.root}/lib/modules/{kernel.version}"
+                    if not os.path.exists(kernel.moddir):
+                        kernel.modfiles = []
+                        kernel.moddir = None
             # Check if modules.order exists, otherwise fallback to mods=none
-            if os.path.exists(mod_file):
+            elif os.path.exists(mod_file):
                 # Check if virtme's kernel modules directory needs to be updated
                 if not os.path.exists(virtme_mod_file) or is_file_more_recent(
                     mod_file, virtme_mod_file
@@ -758,7 +783,7 @@ def export_virtiofs(
 
     # Adjust qemu options to use virtiofsd
     fsid = f"virtfs{len(qemuargs)}"
-    vhost_dev_type = arch.vhost_dev_type()
+    vhost_dev_type = arch.vhost_dev_type("user-fs")
 
     qemuargs.extend(["-chardev", f"socket,id=char{fsid},path={virtio_fs.sock}"])
     qemuargs.extend(
@@ -858,6 +883,18 @@ def can_use_kvm(args):
     return can_access_file("/dev/kvm")
 
 
+def all_tools_available(tools: List[str]) -> bool:
+    return all(map(lambda tool: which(tool) is not None, tools))
+
+
+def can_use_ssh_over_vsock(ssh_tcp: bool) -> bool:
+    return (
+        not ssh_tcp
+        and all_tools_available(["setsid", "systemd-socket-activate"])
+        and can_access_file("/dev/vhost-vsock")
+    )
+
+
 def can_use_microvm(args):
     return (
         not args.disable_microvm
@@ -915,6 +952,9 @@ def get_console_path(port):
 
 
 def console_client(args):
+    if which("socat") is None:
+        arg_fail("socat tool is required, but not available")
+
     try:
         # with tty support
         (cols, rows) = os.get_terminal_size()
@@ -997,18 +1037,26 @@ def console_server(args, qemu, arch, qemuargs, kernelargs):
             kernelargs.append(f"virtme_vsockmount={console_script_dir}")
 
     kernelargs.extend([f"virtme.vsockexec=`{console_exec}`"])
-    qemuargs.extend(["-device", f"vhost-vsock-pci,guest-cid={args.port}"])
+    qemuargs.extend(
+        ["-device", f"{arch.vhost_dev_type('vsock')},guest-cid={args.port}"]
+    )
 
 
 def ssh_client(args):
+    if can_use_ssh_over_vsock(args.ssh_tcp):
+        ssh_destination = f"{VIRTME_SSH_DESTINATION_NAME}{DEFAULT_VIRTME_SSH_HOSTNAME_CID_SEPARATOR}{args.port}"
+    else:
+        ssh_destination = f"ssh://{VIRTME_SSH_DESTINATION_NAME}:{args.port}"
     if args.remote_cmd is not None:
-        exec_escaped = args.remote_cmd.replace('"', '\\"')
-        remote_cmd = ["bash", "-c", exec_escaped]
+        exec_escaped = shlex.quote(args.remote_cmd)
+        remote_cmd = ["--", "bash", "-c", exec_escaped]
     else:
         remote_cmd = []
 
-    cmd = ["ssh", "-p", str(args.port), "localhost"] + remote_cmd
-
+    cmd = ["ssh", "-F", f"{SSH_CONF_FILE}"]
+    if args.user:
+        cmd += ["-l", f"{args.user}"]
+    cmd += [ssh_destination] + remote_cmd
     if args.dry_run:
         print(shlex.join(cmd))
     else:
@@ -1016,24 +1064,60 @@ def ssh_client(args):
 
 
 def ssh_server(args, arch, qemuargs, kernelargs):
-    # Check if we need to generate the ssh host keys for the guest.
-    ssh_key_dir = f"{CACHE_DIR}/.ssh"
-    os.makedirs(f"{ssh_key_dir}/etc/ssh", exist_ok=True)
-    os.system(f"ssh-keygen -A -f {ssh_key_dir}")
-
-    # Implicitly enable dhcp to automatically get an IP on the network
-    # interface and prevent interface renaming.
-    kernelargs.extend(["virtme.dhcp", "net.ifnames=0", "biosdevname=0"])
+    # Check if we need to generate the SSH host keys for the guest.
+    SSH_ETC_SSH_DIR = SSH_DIR.joinpath("etc", "ssh")
+    SSH_ETC_SSH_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    subprocess.check_call(["ssh-keygen", "-A", "-f", f"{SSH_DIR}"])
 
     # Tell virtme-ng-init / virtme-init to start sshd and use the current
     # username keys/credentials.
     username = get_username()
-    kernelargs.extend(["virtme.ssh"])
-    kernelargs.extend([f"virtme_ssh_user={username}"])
+    if can_use_ssh_over_vsock(args.ssh_tcp):
+        qemuargs.extend(
+            [
+                "-device",
+                f"{arch.vhost_dev_type('vsock')},guest-cid={args.port}",
+            ]
+        )
+        ssh_channel_type = "vsock"
+    else:
+        # Implicitly enable dhcp to automatically get an IP on the network
+        # interface and prevent interface renaming.
+        kernelargs.extend(["virtme.dhcp", "net.ifnames=0", "biosdevname=0"])
+        # Setup a port forward network interface for the guest.
+        qemuargs.extend(["-device", f"{arch.virtio_dev_type('net')},netdev=ssh"])
+        qemuargs.extend(
+            ["-netdev", f"user,id=ssh,hostfwd=tcp:127.0.0.1:{args.port}-:22"]
+        )
+        ssh_channel_type = "tcp"
 
-    # Setup a port forward network interface for the guest.
-    qemuargs.extend(["-device", "{},netdev=ssh".format(arch.virtio_dev_type("net"))])
-    qemuargs.extend(["-netdev", f"user,id=ssh,hostfwd=tcp:127.0.0.1:{args.port}-:22"])
+    kernelargs.extend(
+        [
+            "virtme.ssh",
+            f"virtme_ssh_channel={ssh_channel_type}",
+            f"virtme_ssh_user={username}",
+        ]
+    )
+
+    ssh_proxy = os.path.realpath(resources.find_script("virtme-ssh-proxy"))
+    with open(SSH_CONF_FILE, "w", encoding="utf-8") as f:
+        f.write(f"""Host {VIRTME_SSH_DESTINATION_NAME}*
+    CheckHostIP no
+
+    # Disable all kinds of host identity checks, since these addresses are generally ephemeral.
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+
+Host {VIRTME_SSH_DESTINATION_NAME}
+    HostName localhost
+
+Host""")
+        for sep in VIRTME_SSH_HOSTNAME_CID_SEPARATORS:
+            f.write(f" {VIRTME_SSH_DESTINATION_NAME}{sep}*")
+        f.write(f"""
+    ProxyCommand "{ssh_proxy}" --port %p %h
+    ProxyUseFdpass yes
+""")
 
 
 # Allowed characters in mount paths.  We can extend this over time if needed.
@@ -1696,11 +1780,9 @@ def do_it() -> int:
         # Set up the initramfs (warning: hack ahead)
         if args.save_initramfs is not None:
             initramfsfile = open(args.save_initramfs, "xb")
-            initramfsfd = initramfsfile.fileno()
         else:
-            initramfsfd, tmpname = tempfile.mkstemp("irfs")
-            os.unlink(tmpname)
-            initramfsfile = os.fdopen(initramfsfd, "r+b")
+            initramfsfile = tempfile.TemporaryFile(suffix="irfs")
+        initramfsfd = initramfsfile.fileno()
         mkinitramfs.mkinitramfs(initramfsfile, config)
         initramfsfile.flush()
         if args.save_initramfs is not None:
@@ -1774,7 +1856,7 @@ def do_it() -> int:
         qemuargs.extend(args.qemu_opts)
 
     if args.show_command:
-        print(" ".join(shlex.quote(a) for a in qemuargs))
+        print(shlex.join(qemuargs))
 
     # Go!
     if not args.dry_run:

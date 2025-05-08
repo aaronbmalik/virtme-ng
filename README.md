@@ -223,9 +223,15 @@ Examples
 
  - Build the kernel using a separate build directory, and run it, in verbose:
 ```
-   $ mkdir -p .virtme/build
-   $ vng O=.virtme/build --build --verbose
-   $ vng O=.virtme/build --verbose
+   $ export KBUILD_OUTPUT=.virtme/build
+   $ vng --build --verbose
+   $ vng --verbose
+```
+
+ - Same example, but using `O=`:
+```
+   $ vng --build --verbose -- O=.virtme/build
+   $ vng --verbose -- O=.virtme/build
 ```
 
  - Accelerate the kernel rebuilds using CCache (if installed):
@@ -426,7 +432,15 @@ Examples
    arighi@virtme-ng~> ./run.sh > result.txt
 
    # In another terminal, copy result.txt from the guest to the host using scp:
-   arighi@gpd3~> scp -P 2222 localhost:~/result.txt .
+   arighi@host~> scp -F ~/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf virtme-ng%2222:~/result.txt .
+
+   # The SSH command can be printed using this command, and easily adapted later:
+   arighi@host~> vng --ssh-client --dry-run
+   ssh -F /home/arighi/.cache/virtme-ng/.ssh/virtme-ng-ssh.conf virtme-ng%2222
+
+   # With systemd >= 256, it is possible to use the 'vsock/<CID>' hostname directly:
+   arighi@host~> ssh vsock/2222
+   arighi@virtme-ng~>
 ```
 
  - Run virtme-ng inside a docker container:
@@ -511,13 +525,15 @@ them in `~/.config/virtme-ng/virtme-ng.conf` under `default_opts` and then
 simply run `vng --build`.
 
 Example (always use an external build server called 'kathleen' and run make
-inside a build chroot called `chroot:lunar-amd64`). To do so, modify the
-`default_opts` sections in `~/.config/virtme-ng/virtme-ng.conf` as following:
+inside a build chroot called `chroot:lunar-amd64`). To do so, add the
+`default_opts` section in `~/.config/virtme-ng/virtme-ng.conf` as following:
 ```
-    "default_opts" : {
+{
+    "default_opts": {
         "build_host": "kathleen",
         "build_host_exec_prefix": "schroot -c chroot:lunar-amd64 --"
     },
+}
 ```
 
 Now you can simply run `vng --build` to build your kernel from the current
